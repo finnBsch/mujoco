@@ -268,6 +268,60 @@ def sensor_pos(m: Model, d: Data) -> Data:
       adr = (adr[:, None] + np.arange(3)[None]).reshape(-1)
     elif sensor_type == SensorType.CLOCK:
       sensor = jp.repeat(d.time, sum(idx))
+    elif sensor_type == SensorType.PLUGIN:
+      # Handle plugin sensors - for now, focus on height_scanner
+      # TODO: This is a simplified implementation for height_scanner plugin
+      # A full implementation would need to identify plugin type and dispatch accordingly
+      
+      # Height scanner parameters (should match C++ plugin defaults)
+      grid_size = (5, 5)  # 5x5 grid
+      spacing = 0.2       # 0.2m spacing
+      max_range = 20.0    # 20m max range
+      
+      # Get sensor site data  
+      site_pos = d.site_xpos[objid]
+      site_mat = d.site_xmat[objid]
+      
+      # Find robot body to exclude from ray casting
+      trunk_body_id = -1
+      for body_id in range(m.nbody):
+        if m.body[body_id].name and 'trunk' in str(m.body[body_id].name):
+          trunk_body_id = body_id
+          break
+      
+      # Generate 5x5 grid of ray origins and directions
+      nrays = grid_size[0] * grid_size[1]
+      
+      def _height_scanner_rays(site_pos_single, site_mat_single):
+        rays_dist = []
+        
+        for i in range(grid_size[0]):
+          for j in range(grid_size[1]):
+            # Ray origin offset in sensor frame
+            x_offset = (i - (grid_size[0] - 1) / 2.0) * spacing
+            y_offset = (j - (grid_size[1] - 1) / 2.0) * spacing
+            z_offset = 0.0
+            
+            # Transform to world coordinates
+            ray_origin_local = jp.array([x_offset, y_offset, z_offset])
+            ray_direction_local = jp.array([0., 0., -1.])  # Downward
+            
+            # Transform to world frame
+            ray_origin = site_pos_single + site_mat_single @ ray_origin_local
+            ray_direction = site_mat_single @ ray_direction_local
+            
+            # Cast ray
+            dist, _ = ray.ray(m, d, ray_origin, ray_direction, 
+                             flg_static=True, bodyexclude=trunk_body_id)
+            
+            # Clamp to max range
+            dist = jp.where(dist < 0, max_range, jp.minimum(dist, max_range))
+            rays_dist.append(dist)
+        
+        return jp.array(rays_dist)
+      
+      # Apply to all sensors of this type
+      sensor = jax.vmap(_height_scanner_rays)(site_pos, site_mat).reshape(-1)
     else:
       # TODO(taylorhowell): raise error after adding sensor check to io.py
       continue  # unsupported sensor type
