@@ -14,10 +14,12 @@
 # ==============================================================================
 """Functions for ray interesection testing."""
 
+from functools import partial
 from typing import Sequence, Tuple
 
 import jax
 from jax import numpy as jp
+from jax.scipy.ndimage import map_coordinates
 import mujoco
 from mujoco.mjx._src import math
 # pylint: disable=g-importing-member
@@ -32,6 +34,7 @@ def _ray_quad(
     a: jax.Array, b: jax.Array, c: jax.Array
 ) -> Tuple[jax.Array, jax.Array]:
   """Returns two solutions for quadratic: a*x^2 + 2*b*x + c = 0."""
+  a = jp.where(jp.abs(a) < mujoco.mjMINVAL, mujoco.mjMINVAL, a)
   det = b * b - a * c
   det_2 = jp.sqrt(det)
 
@@ -48,12 +51,14 @@ def _ray_plane(
     vec: jax.Array,
 ) -> jax.Array:
   """Returns the distance at which a ray intersects with a plane."""
-  x = -pnt[2] / vec[2]
+  # replace zero vec components with small number to avoid division by zero
+  safe_vec = jp.where(jp.abs(vec) < mujoco.mjMINVAL, mujoco.mjMINVAL, vec)
+  x = -pnt[2] / safe_vec[2]
 
-  valid = vec[2] <= -mujoco.mjMINVAL  # z-vec pointing towards front face
+  valid = safe_vec[2] <= -mujoco.mjMINVAL  # z-vec pointing towards front face
   valid &= x >= 0
   # only within rendered rectangle
-  p = pnt[0:2] + x * vec[0:2]
+  p = pnt[0:2] + x * safe_vec[0:2]
   valid &= jp.all((size[0:2] <= 0) | (jp.abs(p) <= size[0:2]))
 
   return jp.where(valid, x, jp.inf)
@@ -137,21 +142,46 @@ def _ray_box(
     vec: jax.Array,
 ) -> jax.Array:
   """Returns the distance at which a ray intersects with a box."""
-
+  # replace zero vec components with small number to avoid division by zero
+  safe_vec = jp.where(jp.abs(vec) < mujoco.mjMINVAL, mujoco.mjMINVAL, vec)
   iface = jp.array([(1, 2), (0, 2), (0, 1), (1, 2), (0, 2), (0, 1)])
 
   # side +1, -1
   # solution of pnt[i] + x * vec[i] = side * size[i]
-  x = jp.concatenate([(size - pnt) / vec, (-size - pnt) / vec])
+  x = jp.concatenate([(size - pnt) / safe_vec, (-size - pnt) / safe_vec])
 
   # intersection with face
-  p0 = pnt[iface[:, 0]] + x * vec[iface[:, 0]]
-  p1 = pnt[iface[:, 1]] + x * vec[iface[:, 1]]
+  p_intersect = pnt + x[:, None] * vec
+  p0 = p_intersect[jp.arange(6), iface[:, 0]]
+  p1 = p_intersect[jp.arange(6), iface[:, 1]]
   valid = jp.abs(p0) <= size[iface[:, 0]]
   valid &= jp.abs(p1) <= size[iface[:, 1]]
   valid &= x >= 0
 
-  return jp.min(jp.where(valid, x, jp.inf))
+  return jp.min(jp.where(valid, x, jp.inf), initial=jp.inf)
+
+
+def _ray_box_6(
+    size: jax.Array, pnt: jax.Array, vec: jax.Array
+) -> jax.Array:
+  """Returns intersection distances for all 6 faces of a box."""
+  # replace zero vec components with small number to avoid division by zero
+  safe_vec = jp.where(jp.abs(vec) < mujoco.mjMINVAL, mujoco.mjMINVAL, vec)
+  iface = jp.array([(1, 2), (1, 2), (0, 2), (0, 2), (0, 1), (0, 1)])
+
+  # distances to planes for each of the 6 faces (+x, -x, +y, -y, +z, -z)
+  x = jp.concatenate([(size - pnt) / safe_vec, (-size - pnt) / safe_vec])
+
+  # check if intersection points are within face bounds
+  p_intersect = pnt + x[:, None] * vec
+  p_check_dim1 = jp.abs(p_intersect[jp.arange(6), iface[:, 0]])
+  p_check_dim2 = jp.abs(p_intersect[jp.arange(6), iface[:, 1]])
+  valid = (p_check_dim1 <= size[iface[:, 0]]) & (
+      p_check_dim2 <= size[iface[:, 1]]
+  )
+  valid &= x >= 0
+
+  return jp.where(valid, x, jp.inf)
 
 
 def _ray_triangle(
@@ -169,14 +199,18 @@ def _ray_triangle(
   A = planar[0:2] - planar[2]  # pylint: disable=invalid-name
   b = -planar[2]
   det = A[0, 0] * A[1, 1] - A[1, 0] * A[0, 1]
+  safe_det = jp.where(jp.abs(det) < mujoco.mjMINVAL, mujoco.mjMINVAL, det)
 
-  t0 = (A[1, 1] * b[0] - A[1, 0] * b[1]) / det
-  t1 = (-A[0, 1] * b[0] + A[0, 0] * b[1]) / det
-  valid = (t0 >= 0) & (t1 >= 0) & (t0 + t1 <= 1)
+  t0 = (A[1, 1] * b[0] - A[1, 0] * b[1]) / safe_det
+  t1 = (-A[0, 1] * b[0] + A[0, 0] * b[1]) / safe_det
+  valid = (t0 >= 0) & (t1 >= 0) & (t0 + t1 <= 1) & (jp.abs(det) > 1e-12)
 
   # intersect ray with plane of triangle
   nrm = jp.cross(vert[0] - vert[2], vert[1] - vert[2])
-  dist = jp.dot(vert[2] - pnt, nrm) / jp.dot(vec, nrm)
+  dot_vec_nrm = jp.dot(vec, nrm)
+  safe_dot = jp.where(
+      jp.abs(dot_vec_nrm) < mujoco.mjMINVAL, mujoco.mjMINVAL, dot_vec_nrm)
+  dist = jp.dot(vert[2] - pnt, nrm) / safe_dot
   valid &= dist >= 0
   dist = jp.where(valid, dist, jp.inf)
 
@@ -200,6 +234,8 @@ def _ray_mesh(
   vertadr = np.append(m.mesh_vertadr, m.nmeshvert)
 
   dists, geom_ids = [], []
+  # This python loop is acceptable because it iterates over different meshes
+  # which may have different numbers of faces, preventing a simple vmap.
   for i, id_ in enumerate(data_id):
     face = m.mesh_face[faceadr[id_] : faceadr[id_ + 1]]
     vert = m.mesh_vert[vertadr[id_] : vertadr[id_ + 1]]
@@ -219,7 +255,116 @@ def _ray_mesh(
 
   return dist, id_
 
+@partial(jax.jit, static_argnames=('nrow', 'ncol'))
+def _ray_hfield_static(
+    hfield_data_flat: jax.Array,
+    size: jax.Array,
+    pnt: jax.Array,
+    vec: jax.Array,
+    adr: jax.Array,
+    nrow: int,
+    ncol: int,
+) -> jax.Array:
+  """JIT-compiled kernel to raycast against a single hfield size.
 
+  This version includes a manual implementation of side-face intersection
+  to precisely match the logic of MuJoCo's C implementation.
+  """
+  # size: (xy_size_x, xy_size_y, height_range, base_thickness)
+  # Intersection with base box
+  base_size = jp.array([size[0], size[1], size[3] / 2.0])
+  base_pos = jp.array([0, 0, -size[3] / 2.0])
+  dist = _ray_box(base_size, pnt - base_pos, vec)
+
+  # Intersection with top box (containing terrain)
+  top_size = jp.array([size[0], size[1], size[2] / 2.0])
+  top_pos = jp.array([0, 0, size[2] / 2.0])
+  top_dists_all = _ray_box_6(top_size, pnt - top_pos, vec)
+  top_dist_min = jp.min(top_dists_all, initial=jp.inf)
+
+  def _intersect_surface() -> jax.Array:
+    r_idx_grid, c_idx_grid = jp.meshgrid(
+        jp.arange(nrow), jp.arange(ncol), indexing='ij'
+    )
+    flat_indices = (adr + r_idx_grid * ncol + c_idx_grid).flatten()
+    hfield_data = hfield_data_flat[flat_indices].reshape((nrow, ncol))
+
+    # 1. Test against all triangles in the grid.
+    # Use initial=jp.inf for safety against empty arrays if nrow/ncol <= 1
+    min_tri_dist = jp.inf
+    if nrow > 1 and ncol > 1:
+      dx = 2.0 * size[0] / (ncol - 1)
+      dy = 2.0 * size[1] / (nrow - 1)
+      x_coords = c_idx_grid * dx - size[0]
+      y_coords = r_idx_grid * dy - size[1]
+      z_coords = hfield_data * size[2]
+      v00 = jp.stack([x_coords[:-1, :-1], y_coords[:-1, :-1], z_coords[:-1, :-1]],
+                     axis=-1)
+      v10 = jp.stack([x_coords[1:, :-1], y_coords[1:, :-1], z_coords[1:, :-1]],
+                     axis=-1)
+      v01 = jp.stack([x_coords[:-1, 1:], y_coords[:-1, 1:], z_coords[:-1, 1:]],
+                     axis=-1)
+      v11 = jp.stack([x_coords[1:, 1:], y_coords[1:, 1:], z_coords[1:, 1:]],
+                     axis=-1)
+      tri1_verts = jp.stack([v00, v11, v10], axis=-2).reshape(-1, 3, 3)
+      tri2_verts = jp.stack([v00, v11, v01], axis=-2).reshape(-1, 3, 3)
+      verts = jp.concatenate([tri1_verts, tri2_verts])
+      basis = jp.array(math.orthogonals(math.normalize(vec))).T
+      tri_dists = jax.vmap(_ray_triangle, in_axes=(0, None, None, None))(
+          verts, pnt, vec, basis
+      )
+      min_tri_dist = jp.min(tri_dists, initial=jp.inf)
+
+    # 2. Test against the four vertical side faces of the top box.
+    # This section manually replicates the C-code's 1D linear interpolation
+    # for side hits to ensure identical behavior at the boundaries.
+    d_sides = top_dists_all[0:4] # Distances for +x, -x, +y, -y faces
+    p_sides = pnt + d_sides[:, None] * vec
+
+    safe_dx = jp.where(ncol > 1, 2.0 * size[0] / (ncol - 1), 1.0)
+    safe_dy = jp.where(nrow > 1, 2.0 * size[1] / (nrow - 1), 1.0)
+
+    # Handle sides normal to X-axis (+x, -x faces)
+    y_float_x_sides = (p_sides[:2, 1] + size[1]) / safe_dy
+    y0_x_sides = jp.clip(jp.floor(y_float_x_sides).astype(int), 0, nrow - 2)
+    # Use rounded indices to match MuJoCo C implementation
+    y0_rounded = jp.round(y0_x_sides).astype(int)
+    y1_rounded = jp.round(y0_x_sides + 1).astype(int)
+    x_indices = jp.array([ncol - 1, 0]) # Grid indices for +x and -x edges
+    z0_x = hfield_data[y0_rounded, x_indices]
+    z1_x = hfield_data[y1_rounded, x_indices]
+    interp_h_x = z0_x * (y0_x_sides + 1 - y_float_x_sides) + z1_x * (
+        y_float_x_sides - y0_x_sides
+    )
+
+    # Handle sides normal to Y-axis (+y, -y faces)
+    x_float_y_sides = (p_sides[2:, 0] + size[0]) / safe_dx
+    x0_y_sides = jp.clip(jp.floor(x_float_y_sides).astype(int), 0, ncol - 2)
+    # Use rounded indices to match MuJoCo C implementation
+    x0_rounded = jp.round(x0_y_sides).astype(int)
+    x1_rounded = jp.round(x0_y_sides + 1).astype(int)
+    y_indices = jp.array([nrow - 1, 0]) # Grid indices for +y and -y edges
+    z0_y = hfield_data[y_indices, x0_rounded]
+    z1_y = hfield_data[y_indices, x1_rounded]
+    interp_h_y = z0_y * (x0_y_sides + 1 - x_float_y_sides) + z1_y * (
+        x_float_y_sides - x0_y_sides
+    )
+
+    # Combine interpolated heights, scale to world units, and check validity
+    interp_h_norm = jp.concatenate([interp_h_x, interp_h_y])
+    interp_h = interp_h_norm * size[2]
+    valid_side_hit = p_sides[:, 2] < interp_h
+    side_dists = jp.where(valid_side_hit, d_sides, jp.inf)
+    min_side_dist = jp.min(side_dists, initial=jp.inf)
+
+    return jp.minimum(min_tri_dist, min_side_dist)
+
+  dist_surface = jax.lax.cond(
+      jp.isinf(top_dist_min), lambda: jp.inf, _intersect_surface
+  )
+  return jp.minimum(dist, dist_surface)
+
+# This dictionary does not include HFIELD, it is handled separately.
 _RAY_FUNC = {
     GeomType.PLANE: _ray_plane,
     GeomType.SPHERE: _ray_sphere,
@@ -228,7 +373,6 @@ _RAY_FUNC = {
     GeomType.BOX: _ray_box,
     GeomType.MESH: _ray_mesh,
 }
-
 
 def ray(
     m: Model,
@@ -254,13 +398,12 @@ def ray(
     dist: distance from ray origin to geom surface (or -1.0 for no intersection)
     id: id of intersected geom (or -1 for no intersection)
   """
-
   dists, ids = [], []
   geom_filter = m.geom_bodyid != bodyexclude
   geom_filter &= flg_static | (m.body_weldid[m.geom_bodyid] != 0)
   if geomgroup:
     geomgroup = np.array(geomgroup, dtype=bool)
-    geom_filter &= geomgroup[np.clip(m.geom_group, 0, mujoco.mjNGROUP)]
+    geom_filter &= geomgroup[np.clip(m.geom_group, 0, mujoco.mjNGROUP - 1)]
 
   # map ray to local geom frames
   geom_pnts = jax.vmap(lambda x, y: x.T @ (pnt - y))(d.geom_xmat, d.geom_xpos)
@@ -268,30 +411,191 @@ def ray(
 
   geom_filter_dyn = (m.geom_matid != -1) | (m.geom_rgba[:, 3] != 0)
   geom_filter_dyn &= (m.geom_matid == -1) | (m.mat_rgba[m.geom_matid, 3] != 0)
+
+  # Process non-HField geoms first
   for geom_type, fn in _RAY_FUNC.items():
     (id_,) = np.nonzero(geom_filter & (m.geom_type == geom_type))
-
     if id_.size == 0:
       continue
 
-    args = m.geom_size[id_], geom_pnts[id_], geom_vecs[id_]
-
     if geom_type == GeomType.MESH:
-      dist, id_ = fn(m, id_, *args)
+      args = (m, id_, m.geom_size[id_], geom_pnts[id_], geom_vecs[id_])
+      dist, id_ = fn(*args)
     else:
+      # remove model and id from args for primitive functions
+      args = (m.geom_size[id_], geom_pnts[id_], geom_vecs[id_])
       dist = jax.vmap(fn)(*args)
 
     dist = jp.where(geom_filter_dyn[id_], dist, jp.inf)
-    dists, ids = dists + [dist], ids + [id_]
+    dists.append(dist)
+    ids.append(id_)
+
+  # Special handling for HFields by grouping them by size
+  (hfield_ids,) = np.nonzero(geom_filter & (m.geom_type == GeomType.HFIELD))
+  if hfield_ids.size > 0:
+    hfield_dataids = m.geom_dataid[hfield_ids]
+    sizes = np.stack([m.hfield_nrow[hfield_dataids],
+                      m.hfield_ncol[hfield_dataids]], axis=-1)
+    unique_sizes, inverse_indices = np.unique(
+        sizes, axis=0, return_inverse=True
+    )
+
+    hfield_dists = jp.full_like(hfield_ids, jp.inf, dtype=jp.float32)
+    hfield_data_flat = jp.asarray(m.hfield_data)
+
+    for i, (nrow, ncol) in enumerate(unique_sizes):
+      (current_size_indices,) = np.nonzero(inverse_indices == i)
+      geom_indices = hfield_ids[current_size_indices]
+      hfield_ids_for_geoms = m.geom_dataid[geom_indices]
+
+      args = (
+          hfield_data_flat,
+          m.hfield_size[hfield_ids_for_geoms],
+          geom_pnts[geom_indices],
+          geom_vecs[geom_indices],
+          jp.asarray(m.hfield_adr)[hfield_ids_for_geoms],
+          nrow,
+          ncol,
+      )
+      vmapped_fn = jax.vmap(
+          _ray_hfield_static, in_axes=(None, 0, 0, 0, 0, None, None)
+      )
+      computed_dists = vmapped_fn(*args)
+      hfield_dists = hfield_dists.at[current_size_indices].set(computed_dists)
+
+    dist = jp.where(geom_filter_dyn[hfield_ids], hfield_dists, jp.inf)
+    dists.append(dist)
+    ids.append(hfield_ids)
 
   if not ids:
-    return jp.array(-1), jp.array(-1.0)
+    return jp.array(-1.0), jp.array(-1)
 
   dists = jp.concatenate(dists)
   ids = jp.concatenate(ids)
   min_id = jp.argmin(dists)
-  dist = jp.where(jp.isinf(dists[min_id]), -1, dists[min_id])
+  dist = jp.where(jp.isinf(dists[min_id]), -1.0, dists[min_id])
   id_ = jp.where(jp.isinf(dists[min_id]), -1, ids[min_id])
+
+  return dist, id_
+
+# NEW, OPTIMIZED AND CORRECTED FUNCTION FOR BATCHED RAYS
+def batch_ray(
+    m: Model,
+    d: Data,
+    pnts: jax.Array,
+    vec: jax.Array,
+    geomgroup: Sequence[int] = (),
+    flg_static: bool = True,
+    bodyexclude: int = -1,
+) -> Tuple[jax.Array, jax.Array]:
+  """Returns geom ids and distances for a batch of rays with a shared direction.
+
+  This function is optimized for the case where `vec` is constant and `pnts`
+  is a batch of multiple ray origins.
+
+  Args:
+    m: MJX model
+    d: MJX data
+    pnts: ray origin points (num_rays, 3)
+    vec: shared ray direction (3,)
+    geomgroup: group inclusion/exclusion mask, or empty to ignore
+    flg_static: if True, allows rays to intersect with static geoms
+    bodyexclude: ignore geoms on specified body id
+
+  Returns:
+    dists: distances from each ray origin to geom surface (num_rays,)
+           (-1.0 for no intersection)
+    ids: ids of intersected geom for each ray (num_rays,)
+         (-1 for no intersection)
+  """
+  num_rays = pnts.shape[0]
+  dists, ids = [], []
+
+  # 1. Filter geoms based on criteria
+  geom_filter = m.geom_bodyid != bodyexclude
+  geom_filter &= flg_static | (m.body_weldid[m.geom_bodyid] != 0)
+  if geomgroup:
+    geomgroup = np.array(geomgroup, dtype=bool)
+    geom_filter &= geomgroup[np.clip(m.geom_group, 0, mujoco.mjNGROUP - 1)]
+
+  geom_filter_dyn = (m.geom_matid != -1) | (m.geom_rgba[:, 3] != 0)
+  geom_filter_dyn &= (m.geom_matid == -1) | (m.mat_rgba[m.geom_matid, 3] != 0)
+
+  # 2. Pre-compute local-space vectors (once for all rays)
+  geom_vecs = jax.vmap(lambda x: x.T @ vec)(d.geom_xmat)  # (num_geoms, 3)
+  geom_pnts = jax.vmap(lambda p: jax.vmap(lambda x, y: x.T @ (p - y))(d.geom_xmat, d.geom_xpos))(pnts)  # (num_rays, num_geoms, 3)
+
+  # Process non-HField geoms first
+  for geom_type, fn in _RAY_FUNC.items():
+    (id_,) = np.nonzero(geom_filter & (m.geom_type == geom_type))
+    if id_.size == 0:
+      continue
+
+    if geom_type == GeomType.MESH:
+      # args = (m, id_, m.geom_size[id_], geom_pnts[id_], geom_vecs[id_])
+      # dist, id_ = fn(*args)
+      pass
+    else:
+      # remove model and id from args for primitive functions
+      dist = jax.vmap(lambda p: jax.vmap(fn)(m.geom_size[id_], p, geom_vecs[id_]))(geom_pnts[:, id_])
+
+      dist = jax.vmap(lambda d: jp.where(geom_filter_dyn[id_], d, jp.inf))(dist)
+      dists.append(dist)
+      ids.append(id_)
+
+  # Special handling for HFields by grouping them by size
+  (hfield_ids,) = np.nonzero(geom_filter & (m.geom_type == GeomType.HFIELD))
+  if hfield_ids.size > 0:
+    hfield_dataids = m.geom_dataid[hfield_ids]
+    sizes = np.stack([m.hfield_nrow[hfield_dataids],
+                      m.hfield_ncol[hfield_dataids]], axis=-1)
+    unique_sizes, inverse_indices = np.unique(
+        sizes, axis=0, return_inverse=True
+    )
+
+    hfield_dists = jp.full((num_rays, hfield_ids.shape[0]), jp.inf, dtype=jp.float32)
+    hfield_data_flat = jp.asarray(m.hfield_data)
+
+    for i, (nrow, ncol) in enumerate(unique_sizes):
+      (current_size_indices,) = np.nonzero(inverse_indices == i)
+      geom_indices = hfield_ids[current_size_indices]
+
+      # args = (
+      #     hfield_data_flat,
+      #     m.geom_size[geom_indices],
+      #     geom_pnts[:, geom_indices],  # (num_rays, geom_indices, 3)
+      #     geom_vecs[geom_indices], # (geom_indices, 3)
+      #     jp.asarray(m.geom_dataid)[geom_indices],
+      #     nrow,
+      #     ncol,
+      # )
+      vmapped_fn = jax.vmap(
+          _ray_hfield_static, in_axes=(None, 0, 0, 0, 0, None, None)
+      )
+      # This is usually just over one dimension, no worries
+      hfield_ids_for_geoms = m.geom_dataid[geom_indices]
+      computed_dists = jax.vmap(lambda p: vmapped_fn(hfield_data_flat,
+          m.hfield_size[hfield_ids_for_geoms],
+          p,
+          geom_vecs[geom_indices], # (geom_indices, 3)
+          jp.asarray(m.hfield_adr)[hfield_ids_for_geoms],
+          nrow,
+          ncol,))(geom_pnts[:, geom_indices])
+      # TODO the [:] thing doesn't probably work the way we want it to.
+      hfield_dists = hfield_dists.at[:, current_size_indices].set(computed_dists)
+    dist = jax.vmap(lambda d: jp.where(geom_filter_dyn[hfield_ids], d, jp.inf))(hfield_dists)
+    dists.append(dist)
+    ids.append(hfield_ids)
+
+  if not ids:
+    return jp.array(-1.0), jp.array(-1)
+
+  dists = jp.concatenate(dists, axis=1)
+  ids = jp.concatenate(ids)
+  min_id = jp.argmin(dists, axis=1)
+  min_dists = dists[jax.numpy.arange(dists.shape[0]), min_id]
+  dist = jp.where(jp.isinf(min_dists), -1.0, min_dists)
+  id_ = jp.where(jp.isinf(dists[:, min_id]), -1, ids[min_id])
 
   return dist, id_
 
@@ -310,4 +614,9 @@ def ray_geom(
   Returns:
     dist: distance from ray origin to geom surface
   """
+  # This function does not support MESH or HFIELD as they require the model.
+  if geomtype in [GeomType.MESH, GeomType.HFIELD]:
+    raise NotImplementedError(
+        f'{geomtype} not supported by ray_geom. Use mjx.ray instead.'
+    )
   return _RAY_FUNC[geomtype](size, pnt, vec)

@@ -165,9 +165,9 @@ def sensor_pos(m: Model, d: Data) -> Data:
         site_xpos = d.site_xpos[objids]
         site_mat = d.site_xmat[objids].reshape((-1, 9))[:, np.array([2, 5, 8])]
         cutoffs = cutoff[idxs]
-        sensor, _ = jax.vmap(
-            ray.ray, in_axes=(None, None, 0, 0, None, None, None)
-        )(m, d, site_xpos, site_mat, (), True, sid)
+        sensor, _ = ray.batch_ray(
+            m, d, site_xpos, site_mat[0], (), True, sid
+        )
         sensors.append(_apply_cutoff(sensor, cutoffs, data_type[0]))
         adrs.append(adr[idxs])
       continue  # avoid adding to sensors/adrs list a second time
