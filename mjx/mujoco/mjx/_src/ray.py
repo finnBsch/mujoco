@@ -15,7 +15,7 @@
 """Functions for ray interesection testing."""
 
 from functools import partial
-from typing import Sequence, Tuple
+from typing import List, Sequence, Tuple, Union
 
 import jax
 from jax import numpy as jp
@@ -486,7 +486,7 @@ def batch_ray(
     vec: jax.Array,
     geomgroup: Sequence[int] = (),
     flg_static: bool = True,
-    bodyexclude: int = -1,
+    bodyexclude: Union[int, List[int]] = -1,
 ) -> Tuple[jax.Array, jax.Array]:
   """Returns geom ids and distances for a batch of rays with a shared direction.
 
@@ -500,7 +500,7 @@ def batch_ray(
     vec: shared ray direction (3,)
     geomgroup: group inclusion/exclusion mask, or empty to ignore
     flg_static: if True, allows rays to intersect with static geoms
-    bodyexclude: ignore geoms on specified body id
+    bodyexclude: ignore geoms on specified body id (int) or body ids (list)
 
   Returns:
     dists: distances from each ray origin to geom surface (num_rays,)
@@ -512,7 +512,11 @@ def batch_ray(
   dists, ids = [], []
 
   # 1. Filter geoms based on criteria
-  geom_filter = m.geom_bodyid != bodyexclude
+  # Handle both single body ID and list of body IDs for exclusion
+  if isinstance(bodyexclude, (list, tuple)):
+    geom_filter = ~jp.isin(m.geom_bodyid, jp.array(bodyexclude))
+  else:
+    geom_filter = m.geom_bodyid != bodyexclude
   geom_filter &= flg_static | (m.body_weldid[m.geom_bodyid] != 0)
   if geomgroup:
     geomgroup = np.array(geomgroup, dtype=bool)
