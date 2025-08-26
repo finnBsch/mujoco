@@ -15,7 +15,7 @@
 """Functions for ray interesection testing."""
 
 from functools import partial
-from typing import List, Sequence, Tuple, Union
+from typing import Sequence, Tuple
 
 import jax
 from jax import numpy as jp
@@ -142,24 +142,21 @@ def _ray_box(
     vec: jax.Array,
 ) -> jax.Array:
   """Returns the distance at which a ray intersects with a box."""
-  # replace zero vec components with small number to avoid division by zero
-  safe_vec = jp.where(jp.abs(vec) < mujoco.mjMINVAL, mujoco.mjMINVAL, vec)
+
   iface = jp.array([(1, 2), (0, 2), (0, 1), (1, 2), (0, 2), (0, 1)])
 
   # side +1, -1
   # solution of pnt[i] + x * vec[i] = side * size[i]
-  x = jp.concatenate([(size - pnt) / safe_vec, (-size - pnt) / safe_vec])
+  x = jp.concatenate([math.safe_div(size - pnt,  vec), -math.safe_div(size + pnt, vec)])
 
   # intersection with face
-  p_intersect = pnt + x[:, None] * vec
-  p0 = p_intersect[jp.arange(6), iface[:, 0]]
-  p1 = p_intersect[jp.arange(6), iface[:, 1]]
+  p0 = pnt[iface[:, 0]] + x * vec[iface[:, 0]]
+  p1 = pnt[iface[:, 1]] + x * vec[iface[:, 1]]
   valid = jp.abs(p0) <= size[iface[:, 0]]
   valid &= jp.abs(p1) <= size[iface[:, 1]]
   valid &= x >= 0
 
-  return jp.min(jp.where(valid, x, jp.inf), initial=jp.inf)
-
+  return jp.min(jp.where(valid, x, jp.inf))
 
 def _ray_box_6(
     size: jax.Array, pnt: jax.Array, vec: jax.Array
@@ -486,7 +483,7 @@ def batch_ray(
     vec: jax.Array,
     geomgroup: Sequence[int] = (),
     flg_static: bool = True,
-    bodyexclude: Union[int, List[int]] = -1,
+    bodyexclude: int = -1,
 ) -> Tuple[jax.Array, jax.Array]:
   """Returns geom ids and distances for a batch of rays with a shared direction.
 
@@ -500,7 +497,7 @@ def batch_ray(
     vec: shared ray direction (3,)
     geomgroup: group inclusion/exclusion mask, or empty to ignore
     flg_static: if True, allows rays to intersect with static geoms
-    bodyexclude: ignore geoms on specified body id (int) or body ids (list)
+    bodyexclude: ignore geoms on specified body id
 
   Returns:
     dists: distances from each ray origin to geom surface (num_rays,)
@@ -512,11 +509,8 @@ def batch_ray(
   dists, ids = [], []
 
   # 1. Filter geoms based on criteria
-  # Handle both single body ID and list of body IDs for exclusion
-  if isinstance(bodyexclude, (list, tuple)):
-    geom_filter = ~jp.isin(m.geom_bodyid, jp.array(bodyexclude))
-  else:
-    geom_filter = m.geom_bodyid != bodyexclude
+  geom_filter = ~np.isin(m.geom_bodyid, bodyexclude)
+
   geom_filter &= flg_static | (m.body_weldid[m.geom_bodyid] != 0)
   if geomgroup:
     geomgroup = np.array(geomgroup, dtype=bool)
@@ -542,7 +536,7 @@ def batch_ray(
     else:
       # remove model and id from args for primitive functions
       dist = jax.vmap(lambda p: jax.vmap(fn)(m.geom_size[id_], p, geom_vecs[id_]))(geom_pnts[:, id_])
-
+      
       dist = jax.vmap(lambda d: jp.where(geom_filter_dyn[id_], d, jp.inf))(dist)
       dists.append(dist)
       ids.append(id_)
@@ -599,7 +593,7 @@ def batch_ray(
   min_id = jp.argmin(dists, axis=1)
   min_dists = dists[jax.numpy.arange(dists.shape[0]), min_id]
   dist = jp.where(jp.isinf(min_dists), -1.0, min_dists)
-  id_ = jp.where(jp.isinf(dists[:, min_id]), -1, ids[min_id])
+  id_ = jp.where(jp.isinf(min_dists), -1, ids[min_id])
 
   return dist, id_
 
